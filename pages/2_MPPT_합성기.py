@@ -1,3 +1,27 @@
+import streamlit as st
+
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.title("🔒 랩실 전용 페이지")
+        pwd = st.text_input("비밀번호를 입력하세요", type="password")
+
+        if pwd:
+            if pwd == st.secrets["APP_PASSWORD"]:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("비밀번호가 틀렸습니다.")
+        return False
+
+    return True
+
+
+if not check_password():
+    st.stop()
+
 import io
 import hashlib
 import importlib.util
@@ -501,3 +525,4 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
+
