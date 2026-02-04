@@ -32,6 +32,14 @@ from typing import Optional, Tuple, List, Any, Dict
 
 st.title("🚀 Smart File Unifier")
 
+# =============================
+# (추가) 1분 대용량 보호 설정
+# =============================
+# - 1분 + 공백채우기(reindex) 시 행 수가 폭증하면 공유서버에서 튕길 확률이 큽니다.
+# - 아래 임계값은 보수적으로 잡았습니다. 필요하면 조절하세요.
+FILL_ROW_LIMIT_1MIN = 200_000          # 1분 공백채우기 허용 최대 행수 (약 139일 분량)
+XLSX_ROW_LIMIT_WARN = 150_000          # 엑셀 저장이 위험해지기 시작하는 행수(경고/CSV 권장)
+
 # -----------------------------
 # uploader reset key / confirm
 # -----------------------------
@@ -332,6 +340,23 @@ def normalize_to_day_bounds(start_dt: datetime, end_dt: datetime) -> Tuple[datet
     e = datetime.combine(end_dt.date(), time(23, 59, 59))
     return s, e
 
+# ✅ (추가) 선택 간격 기준 예상 행 수 계산(공백 채우기 안전장치용)
+def estimate_rows(start_dt: datetime, end_dt: datetime, freq_label: str) -> int:
+    seconds = (end_dt - start_dt).total_seconds()
+    if seconds < 0:
+        return 0
+    if freq_label == "1분":
+        step = 60
+    elif freq_label == "10분":
+        step = 600
+    elif freq_label == "1시간":
+        step = 3600
+    elif freq_label == "1일":
+        step = 86400
+    else:
+        step = 60
+    return int(seconds // step) + 1
+
 
 # -----------------------------
 # main
@@ -378,6 +403,17 @@ if uploaded_files:
             if err or df is None:
                 failed.append((f.name, err or "알 수 없는 오류"))
             else:
+                # =============================
+                # (추가) 파일 단위 선정리(기능 유지 + 대용량 안정성↑)
+                # - 기존에 최종 단계에서 하던 정리와 동일한 로직을 "파일별로도" 한 번 수행
+                # - 최종 concat 후에도 기존대로 한 번 더 수행하므로 안전망 유지
+                # =============================
+                if "TIMESTAMP" in df.columns and not df.empty:
+                    df = df.sort_values("TIMESTAMP").reset_index(drop=True)
+                    df = drop_exact_duplicates_excluding_record(df)
+                    df = resolve_timestamp_conflicts_most_non_null(df)
+                    df = df.sort_values("TIMESTAMP").reset_index(drop=True)
+
                 all_dfs.append(df)
                 success.append(f.name)
                 file_schema[f.name] = list(df.columns)
@@ -400,6 +436,7 @@ if uploaded_files:
         if all_dfs:
             combined_df = pd.concat(all_dfs, axis=0, ignore_index=True, sort=False)
 
+            # (기존 기능 유지) 최종 통합본에서도 동일 정리 1회 수행
             if "TIMESTAMP" in combined_df.columns:
                 combined_df = combined_df.sort_values("TIMESTAMP").reset_index(drop=True)
                 combined_df = drop_exact_duplicates_excluding_record(combined_df)
@@ -446,9 +483,18 @@ if uploaded_files:
                     end_time_str = st.text_input("종료 시간(HH:MM)", value=recognized_max.strftime("%H:%M"))
 
                 st.write("#### 🧩 시계열 공백 0 채우기")
-                # ✅ (수정) 1일 단위 추가
                 freq_map = {"1분": "1T", "10분": "10T", "1시간": "1H", "1일": "1D"}
                 freq_label = st.selectbox("데이터 간격(공백 채우기 기준)", ["1분", "10분", "1시간", "1일"], index=2)
+
+                # =============================
+                # (추가) 1분 모드 안전장치 안내
+                # =============================
+                if freq_label == "1분":
+                    st.info(
+                        f"⚠️ 1분 단위는 데이터가 매우 커질 수 있어 공유 서버에서 튕길 수 있습니다.\n"
+                        f"- 공백 채우기(리인덱스)는 선택 기간이 커지면 제한될 수 있습니다.\n"
+                        f"- 임계값: 약 {FILL_ROW_LIMIT_1MIN:,}행(1분 기준) 초과 시 차단"
+                    )
                 fill_missing = st.checkbox("선택 기간 내 누락된 시간을 0으로 채우기", value=True)
 
                 apply_btn = st.form_submit_button("✅ 적용")
@@ -463,7 +509,6 @@ if uploaded_files:
                     start_dt = datetime.combine(start_date, start_time)
                     end_dt = datetime.combine(end_date, end_time)
 
-                    # ✅ (추가) 1일 간격일 때는 날짜 경계로 정규화
                     if freq_label == "1일":
                         start_dt, end_dt = normalize_to_day_bounds(start_dt, end_dt)
 
@@ -475,6 +520,7 @@ if uploaded_files:
                             (combined_df["TIMESTAMP"] <= pd.Timestamp(end_dt))
                         ].copy()
 
+                        # (기존 기능 유지) 기간 필터 후 정리
                         filtered_df = drop_exact_duplicates_excluding_record(filtered_df)
                         filtered_df = resolve_timestamp_conflicts_most_non_null(filtered_df)
 
@@ -482,13 +528,28 @@ if uploaded_files:
                         st.write(f"- 선택 기간 내 실제 데이터 행 수(정리 후): **{len(filtered_df)}행**")
 
                         if fill_missing:
-                            freq = freq_map[freq_label]
-                            filled_df = fill_missing_by_reindex(filtered_df, start_dt, end_dt, freq)
-                            filled_df = fill_zeros_for_numeric_like_columns(filled_df)
-                            filtered_df = filled_df
-                            st.success(f"공백을 0으로 채웠습니다. (간격: {freq_label})")
-
-                        st.session_state["filtered_df"] = filtered_df
+                            # =============================
+                            # (추가) 1분 공백채우기 보호장치
+                            # =============================
+                            est = estimate_rows(start_dt, end_dt, freq_label)
+                            if freq_label == "1분" and est > FILL_ROW_LIMIT_1MIN:
+                                st.error(
+                                    f"1분 단위 공백 채우기는 선택 기간이 너무 깁니다.\n"
+                                    f"- 예상 행 수: {est:,}행\n"
+                                    f"- 허용 한도: {FILL_ROW_LIMIT_1MIN:,}행\n"
+                                    f"기간을 줄이거나, 공백 채우기를 끄고 진행해 주세요."
+                                )
+                                # 공백 채우기만 스킵하고 결과 저장은 진행
+                                st.session_state["filtered_df"] = filtered_df
+                            else:
+                                freq = freq_map[freq_label]
+                                filled_df = fill_missing_by_reindex(filtered_df, start_dt, end_dt, freq)
+                                filled_df = fill_zeros_for_numeric_like_columns(filled_df)
+                                filtered_df = filled_df
+                                st.success(f"공백을 0으로 채웠습니다. (간격: {freq_label})")
+                                st.session_state["filtered_df"] = filtered_df
+                        else:
+                            st.session_state["filtered_df"] = filtered_df
 
         display_df = st.session_state.get("filtered_df", combined_df)
 
@@ -496,19 +557,55 @@ if uploaded_files:
         st.dataframe(display_df.head(10), use_container_width=True)
 
         st.write("### 📥 다운로드")
-        default_name = "Merged_Data_Output.xlsx"
-        file_name_input = st.text_input("저장 파일명", value=default_name)
-        if not file_name_input.lower().endswith(".xlsx"):
-            file_name_input += ".xlsx"
 
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            display_df.to_excel(writer, index=False)
+        # =============================
+        # (추가) 대용량 다운로드 안전장치(기존 Excel 유지 + CSV 옵션 추가)
+        # =============================
+        row_cnt = int(len(display_df))
+        if row_cnt >= XLSX_ROW_LIMIT_WARN:
+            st.warning(
+                f"현재 데이터가 {row_cnt:,}행입니다. 공유 서버에서 Excel(.xlsx) 생성 중 튕길 수 있어 CSV 다운로드를 권장합니다."
+            )
 
-        st.download_button(
-            label="📥 통합 데이터 다운로드 (Excel)",
-            data=output.getvalue(),
-            file_name=file_name_input,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        download_fmt = st.radio(
+            "다운로드 형식",
+            options=["Excel(.xlsx)", "CSV(.csv)"],
+            index=0 if row_cnt < XLSX_ROW_LIMIT_WARN else 1,
+            horizontal=True
         )
 
+        default_base = "Merged_Data_Output"
+        file_name_input = st.text_input("저장 파일명(확장자 제외)", value=default_base).strip()
+        if not file_name_input:
+            file_name_input = default_base
+
+        if download_fmt == "CSV(.csv)":
+            csv_bytes = display_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="📥 통합 데이터 다운로드 (CSV)",
+                data=csv_bytes,
+                file_name=f"{file_name_input}.csv",
+                mime="text/csv"
+            )
+        else:
+            # Excel 다운로드(기존 기능 유지)
+            output = io.BytesIO()
+            try:
+                with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                    display_df.to_excel(writer, index=False)
+                st.download_button(
+                    label="📥 통합 데이터 다운로드 (Excel)",
+                    data=output.getvalue(),
+                    file_name=f"{file_name_input}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            except Exception as e:
+                st.error("Excel 파일 생성 중 오류가 발생했습니다. CSV로 다운로드를 권장합니다.")
+                st.exception(e)
+                csv_bytes = display_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    label="📥 통합 데이터 다운로드 (CSV로 대체)",
+                    data=csv_bytes,
+                    file_name=f"{file_name_input}.csv",
+                    mime="text/csv"
+                )
